@@ -15,7 +15,6 @@ errors:
   - ARGUMENT_FORMAL_GLOBAL
   - ARGUMENT_FORMAL_IVAR
   - ARGUMENT_FORWARDING_UNBOUND
-  - ARGUMENT_IN
   - ARGUMENT_NO_FORWARDING_AMPERSAND
   - ARGUMENT_NO_FORWARDING_ELLIPSES
   - ARGUMENT_NO_FORWARDING_STAR
@@ -99,6 +98,7 @@ errors:
   - EXPECT_EXPRESSION_AFTER_SPLAT
   - EXPECT_EXPRESSION_AFTER_SPLAT_HASH
   - EXPECT_EXPRESSION_AFTER_STAR
+  - EXPECT_FOR_DELIMITER
   - EXPECT_IDENT_REQ_PARAMETER
   - EXPECT_IN_DELIMITER
   - EXPECT_LPAREN_REQ_PARAMETER
@@ -107,6 +107,7 @@ errors:
   - EXPECT_RPAREN
   - EXPECT_RPAREN_AFTER_MULTI
   - EXPECT_RPAREN_REQ_PARAMETER
+  - EXPECT_SINGLETON_CLASS_DELIMITER
   - EXPECT_STRING_CONTENT
   - EXPECT_WHEN_DELIMITER
   - EXPRESSION_BARE_HASH
@@ -140,6 +141,7 @@ errors:
   - INSTANCE_VARIABLE_BARE
   - INVALID_BLOCK_EXIT
   - INVALID_CHARACTER
+  - INVALID_COMMA
   - INVALID_ENCODING_MAGIC_COMMENT
   - INVALID_ESCAPE_CHARACTER
   - INVALID_FLOAT_EXPONENT
@@ -187,6 +189,7 @@ errors:
   - MULTI_ASSIGN_UNEXPECTED_REST
   - NESTING_TOO_DEEP
   - NO_LOCAL_VARIABLE
+  - NON_ASSOCIATIVE_OPERATOR
   - NOT_EXPRESSION
   - NUMBER_LITERAL_UNDERSCORE
   - NUMBERED_PARAMETER_INNER_BLOCK
@@ -821,6 +824,17 @@ nodes:
         kind:
           - SymbolNode
           - InterpolatedSymbolNode
+        comment: |
+          Represents the new name of the method that will be aliased.
+
+              alias foo bar
+                    ^^^
+
+              alias :foo :bar
+                    ^^^^
+
+              alias :"#{foo}" :"#{bar}"
+                    ^^^^^^^^^
       - name: old_name
         type: node
         kind:
@@ -828,6 +842,17 @@ nodes:
           - InterpolatedSymbolNode
           - on error: GlobalVariableReadNode # alias a $b
           - on error: MissingNode # alias a 42
+        comment: |
+          Represents the old name of the method that will be aliased.
+
+              alias foo bar
+                        ^^^
+
+              alias :foo :bar
+                         ^^^^
+
+              alias :"#{foo}" :"#{bar}"
+                              ^^^^^^^^^
       - name: keyword_loc
         type: location
     comment: |
@@ -840,11 +865,26 @@ nodes:
       - name: left
         type: node
         kind: pattern expression
+        comment: |
+          Represents the left side of the expression.
+
+              foo => bar | baz
+                     ^^^
       - name: right
         type: node
         kind: pattern expression
+        comment: |
+          Represents the right side of the expression.
+
+              foo => bar | baz
+                           ^^^
       - name: operator_loc
         type: location
+        comment: |
+          Represents the alternation operator location.
+
+              foo => bar | baz
+                         ^
     comment: |
       Represents an alternation pattern in pattern matching.
 
@@ -3645,7 +3685,7 @@ nodes:
           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
           end
 
-      `Foo, *splat, Bar` are in the `exceptions` field. `ex` is in the `exception` field.
+      `Foo, *splat, Bar` are in the `exceptions` field. `ex` is in the `reference` field.
   - name: RestParameterNode
     flags: ParameterFlags
     fields:

@@ -815,6 +815,19 @@ node_locations(VALUE ast_value, const NODE *node)
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_OR(node)->operator_loc));
+      case NODE_OP_ASGN1:
+        return rb_ary_new_from_args(5,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_OP_ASGN1(node)->call_operator_loc),
+                                    location_new(&RNODE_OP_ASGN1(node)->opening_loc),
+                                    location_new(&RNODE_OP_ASGN1(node)->closing_loc),
+                                    location_new(&RNODE_OP_ASGN1(node)->binary_operator_loc));
+      case NODE_OP_ASGN2:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_OP_ASGN2(node)->call_operator_loc),
+                                    location_new(&RNODE_OP_ASGN2(node)->message_loc),
+                                    location_new(&RNODE_OP_ASGN2(node)->binary_operator_loc));
       case NODE_REDO:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
@@ -823,6 +836,10 @@ node_locations(VALUE ast_value, const NODE *node)
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_RETURN(node)->keyword_loc));
+      case NODE_SPLAT:
+        return rb_ary_new_from_args(2,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_SPLAT(node)->operator_loc));
       case NODE_UNDEF:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),

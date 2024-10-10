@@ -542,8 +542,12 @@ dump_node(VALUE buf, VALUE indent, int comment, const NODE * node)
         F_NODE(nd_recv, RNODE_OP_ASGN1, "receiver");
         F_ID(nd_mid, RNODE_OP_ASGN1, "operator");
         F_NODE(nd_index, RNODE_OP_ASGN1, "index");
-        LAST_NODE;
         F_NODE(nd_rvalue, RNODE_OP_ASGN1, "rvalue");
+        F_LOC(call_operator_loc, RNODE_OP_ASGN1);
+        F_LOC(opening_loc, RNODE_OP_ASGN1);
+        F_LOC(closing_loc, RNODE_OP_ASGN1);
+        LAST_NODE;
+        F_LOC(binary_operator_loc, RNODE_OP_ASGN1);
         return;
 
       case NODE_OP_ASGN2:
@@ -556,8 +560,11 @@ dump_node(VALUE buf, VALUE indent, int comment, const NODE * node)
             A_ID(RNODE_OP_ASGN2(node)->nd_vid);
         }
         F_ID(nd_mid, RNODE_OP_ASGN2, "operator");
-        LAST_NODE;
         F_NODE(nd_value, RNODE_OP_ASGN2, "rvalue");
+        F_LOC(call_operator_loc, RNODE_OP_ASGN2);
+        F_LOC(message_loc, RNODE_OP_ASGN2);
+        LAST_NODE;
+        F_LOC(binary_operator_loc, RNODE_OP_ASGN2);
         return;
 
       case NODE_OP_ASGN_AND:
@@ -895,8 +902,9 @@ dump_node(VALUE buf, VALUE indent, int comment, const NODE * node)
         ANN("splat argument");
         ANN("format: *[nd_head]");
         ANN("example: foo(*ary)");
-        LAST_NODE;
         F_NODE(nd_head, RNODE_SPLAT, "splat'ed array");
+        LAST_NODE;
+        F_LOC(operator_loc, RNODE_SPLAT);
         return;
 
       case NODE_BLOCK_PASS:
