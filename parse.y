@@ -2782,7 +2782,7 @@ rb_parser_ary_free(rb_parser_t *p, rb_parser_ary_t *ary)
 %type <node> f_marg f_rest_marg
 %type <node_masgn> f_margs
 %type <node> assoc_list assocs assoc undef_list backref string_dvar for_var
-%type <node_args> block_param opt_block_param block_param_def
+%type <node_args> block_param opt_block_param_def block_param_def opt_block_param
 %type <id> do bv_decls opt_bv_decl bvar
 %type <node> lambda brace_body do_body
 %type <locations_lambda_body> lambda_body
@@ -2920,6 +2920,28 @@ rb_parser_ary_free(rb_parser_t *p, rb_parser_ary_t *ary)
                     /*% ripper: assign!($:1, $:4) %*/
                     }
                 ;
+
+%rule args_tail_basic(value) <node_args>
+                : f_kwarg(value) ',' f_kwrest opt_f_block_arg
+                    {
+                        $$ = new_args_tail(p, $1, $3, $4, &@3);
+                    /*% ripper: [$:1, $:3, $:4] %*/
+                    }
+                | f_kwarg(value) opt_f_block_arg
+                    {
+                        $$ = new_args_tail(p, $1, 0, $2, &@1);
+                    /*% ripper: [$:1, Qnil, $:2] %*/
+                    }
+                | f_any_kwrest opt_f_block_arg
+                    {
+                        $$ = new_args_tail(p, 0, $1, $2, &@1);
+                    /*% ripper: [Qnil, $:1, $:2] %*/
+                    }
+                | f_block_arg
+                    {
+                        $$ = new_args_tail(p, 0, 0, $1, &@1);
+                    /*% ripper: [Qnil, Qnil, $:1] %*/
+                    }
 
 %rule def_endless_method(bodystmt) <node>
                 : defn_head[head] f_opt_paren_args[args] '=' bodystmt
@@ -3717,7 +3739,7 @@ lhs		: user_or_keyword_variable
                         $$ = aryset(p, $1, $3, &@$);
                     /*% ripper: aref_field!($:1, $:3) %*/
                     }
-                | primary_value call_op tIDENTIFIER
+                | primary_value call_op ident_or_const
                     {
                         $$ = attrset(p, $1, $2, $3, &@$);
                     /*% ripper: field!($:1, $:2, $:3) %*/
@@ -3725,11 +3747,6 @@ lhs		: user_or_keyword_variable
                 | primary_value tCOLON2 tIDENTIFIER
                     {
                         $$ = attrset(p, $1, idCOLON2, $3, &@$);
-                    /*% ripper: field!($:1, $:2, $:3) %*/
-                    }
-                | primary_value call_op tCONSTANT
-                    {
-                        $$ = attrset(p, $1, $2, $3, &@$);
                     /*% ripper: field!($:1, $:2, $:3) %*/
                     }
                 | primary_value tCOLON2 tCONSTANT
@@ -4932,26 +4949,7 @@ f_any_kwrest	: f_kwrest
 
 f_eq		: {p->ctxt.in_argdef = 0;} '=';
 
-block_args_tail	: f_kwarg(primary_value) ',' f_kwrest opt_f_block_arg
-                    {
-                        $$ = new_args_tail(p, $1, $3, $4, &@3);
-                    /*% ripper: [$:1, $:3, $:4] %*/
-                    }
-                | f_kwarg(primary_value) opt_f_block_arg
-                    {
-                        $$ = new_args_tail(p, $1, 0, $2, &@1);
-                    /*% ripper: [$:1, Qnil, $:2] %*/
-                    }
-                | f_any_kwrest opt_f_block_arg
-                    {
-                        $$ = new_args_tail(p, 0, $1, $2, &@1);
-                    /*% ripper: [Qnil, $:1, $:2] %*/
-                    }
-                | f_block_arg
-                    {
-                        $$ = new_args_tail(p, 0, 0, $1, &@1);
-                    /*% ripper: [Qnil, Qnil, $:1] %*/
-                    }
+block_args_tail	: args_tail_basic(primary_value)
                 ;
 
 excessed_comma	: ','
@@ -5040,21 +5038,14 @@ block_param	: f_arg ',' f_optarg(primary_value) ',' f_rest_arg opt_args_tail(blo
                     }
                 ;
 
-opt_block_param	: none
-                | block_param_def
-                    {
-                        p->command_start = TRUE;
-                    }
-                ;
+opt_block_param_def	: none
+                    | block_param_def
+                        {
+                            p->command_start = TRUE;
+                        }
+                    ;
 
-block_param_def	: '|' opt_bv_decl '|'
-                    {
-                        p->max_numparam = ORDINAL_PARAM;
-                        p->ctxt.in_argdef = 0;
-                        $$ = 0;
-                    /*% ripper: block_var!(params!(Qnil,Qnil,Qnil,Qnil,Qnil,Qnil,Qnil), $:2) %*/
-                    }
-                | '|' block_param opt_bv_decl '|'
+block_param_def	: '|' opt_block_param opt_bv_decl '|'
                     {
                         p->max_numparam = ORDINAL_PARAM;
                         p->ctxt.in_argdef = 0;
@@ -5063,6 +5054,13 @@ block_param_def	: '|' opt_bv_decl '|'
                     }
                 ;
 
+opt_block_param	: /* none */
+                    {
+                        $$ = 0;
+                    /*% ripper: params!(Qnil,Qnil,Qnil,Qnil,Qnil,Qnil,Qnil) %*/
+                    }
+                | block_param
+                ;
 
 opt_bv_decl	: '\n'?
                     {
@@ -5300,7 +5298,7 @@ brace_block	: '{' brace_body '}'
 
 brace_body	: {$$ = dyna_push(p);}[dyna]<vars>
                   max_numparam numparam it_id allow_exits
-                  opt_block_param[args] compstmt(stmts)
+                  opt_block_param_def[args] compstmt(stmts)
                     {
                         int max_numparam = p->max_numparam;
                         ID it_id = p->it_id;
@@ -5320,7 +5318,7 @@ do_body 	:   {
                         CMDARG_PUSH(0);
                     }[dyna]<vars>
                   max_numparam numparam it_id allow_exits
-                  opt_block_param[args] bodystmt
+                  opt_block_param_def[args] bodystmt
                     {
                         int max_numparam = p->max_numparam;
                         ID it_id = p->it_id;
@@ -6295,26 +6293,7 @@ f_arglist	: f_paren_args
                     }
                 ;
 
-args_tail	: f_kwarg(arg_value) ',' f_kwrest opt_f_block_arg
-                    {
-                        $$ = new_args_tail(p, $1, $3, $4, &@3);
-                    /*% ripper: [$:1, $:3, $:4] %*/
-                    }
-                | f_kwarg(arg_value) opt_f_block_arg
-                    {
-                        $$ = new_args_tail(p, $1, 0, $2, &@1);
-                    /*% ripper: [$:1, Qnil, $:2] %*/
-                    }
-                | f_any_kwrest opt_f_block_arg
-                    {
-                        $$ = new_args_tail(p, 0, $1, $2, &@1);
-                    /*% ripper: [Qnil, $:1, $:2] %*/
-                    }
-                | f_block_arg
-                    {
-                        $$ = new_args_tail(p, 0, 0, $1, &@1);
-                    /*% ripper: [Qnil, Qnil, $:1] %*/
-                    }
+args_tail	: args_tail_basic(arg_value)
                 | args_forward
                     {
                         ID fwd = $args_forward;
