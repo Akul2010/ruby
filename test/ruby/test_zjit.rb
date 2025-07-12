@@ -62,6 +62,22 @@ class TestZJIT < Test::Unit::TestCase
     }
   end
 
+  def test_setlocal_on_eval
+    assert_compiles '1', %q{
+      @b = binding
+      eval('a = 1', @b)
+      eval('a', @b)
+    }
+  end
+
+  def test_setlocal_on_eval_with_spill
+    assert_compiles '1', %q{
+      @b = binding
+      eval('a = 1; itself', @b)
+      eval('a', @b)
+    }
+  end
+
   def test_nested_local_access
     assert_compiles '[1, 2, 3]', %q{
       1.times do |l2|
@@ -954,6 +970,35 @@ class TestZJIT < Test::Unit::TestCase
   def test_require_rubygems
     assert_runs 'true', %q{
       require 'rubygems'
+    }, call_threshold: 2
+  end
+
+  def test_require_rubygems_with_auto_compact
+    assert_runs 'true', %q{
+      GC.auto_compact = true
+      require 'rubygems'
+    }, call_threshold: 2
+  end
+
+  def test_bop_redefinition
+    assert_runs '[3, :+, 100]', %q{
+      def test
+        1 + 2
+      end
+
+      test # profile opt_plus
+      [test, Integer.class_eval { def +(_) = 100 }, test]
+    }, call_threshold: 2
+  end
+
+  def test_bop_redefinition_with_adjacent_patch_points
+    assert_runs '[15, :+, 100]', %q{
+      def test
+        1 + 2 + 3 + 4 + 5
+      end
+
+      test # profile opt_plus
+      [test, Integer.class_eval { def +(_) = 100 }, test]
     }, call_threshold: 2
   end
 

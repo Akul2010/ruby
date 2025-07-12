@@ -3,6 +3,7 @@ use std::fmt;
 use std::mem::take;
 use crate::codegen::local_size_and_idx_to_ep_offset;
 use crate::cruby::{Qundef, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32};
+use crate::hir::SideExitReason;
 use crate::options::{debug, get_option};
 use crate::{cruby::VALUE};
 use crate::backend::current::*;
@@ -276,10 +277,18 @@ pub enum Target
 {
     /// Pointer to a piece of ZJIT-generated code
     CodePtr(CodePtr),
-    // Side exit with a counter
-    SideExit { pc: *const VALUE, stack: Vec<Opnd>, locals: Vec<Opnd>, c_stack_bytes: usize },
     /// A label within the generated code
     Label(Label),
+    /// Side exit to the interpreter
+    SideExit {
+        pc: *const VALUE,
+        stack: Vec<Opnd>,
+        locals: Vec<Opnd>,
+        c_stack_bytes: usize,
+        reason: SideExitReason,
+        // Some if the side exit should write this label. We use it for patch points.
+        label: Option<Label>,
+    },
 }
 
 impl Target
@@ -484,6 +493,14 @@ pub enum Insn {
     // binary OR operation.
     Or { left: Opnd, right: Opnd, out: Opnd },
 
+    /// Patch point that will be rewritten to a jump to a side exit on invalidation.
+    PatchPoint(Target),
+
+    /// Make sure the last PatchPoint has enough space to insert a jump.
+    /// We insert this instruction at the end of each block so that the jump
+    /// will not overwrite the next block or a side exit.
+    PadPatchPoint,
+
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
 
@@ -541,7 +558,8 @@ impl Insn {
             Insn::Joz(_, target) |
             Insn::Jonz(_, target) |
             Insn::Label(target) |
-            Insn::LeaJumpTarget { target, .. } => {
+            Insn::LeaJumpTarget { target, .. } |
+            Insn::PatchPoint(target) => {
                 Some(target)
             }
             _ => None,
@@ -603,6 +621,8 @@ impl Insn {
             Insn::Mov { .. } => "Mov",
             Insn::Not { .. } => "Not",
             Insn::Or { .. } => "Or",
+            Insn::PatchPoint(_) => "PatchPoint",
+            Insn::PadPatchPoint => "PadPatchPoint",
             Insn::PosMarker(_) => "PosMarker",
             Insn::RShift { .. } => "RShift",
             Insn::Store { .. } => "Store",
@@ -698,7 +718,8 @@ impl Insn {
             Insn::Joz(_, target) |
             Insn::Jonz(_, target) |
             Insn::Label(target) |
-            Insn::LeaJumpTarget { target, .. } => Some(target),
+            Insn::LeaJumpTarget { target, .. } |
+            Insn::PatchPoint(target) => Some(target),
             _ => None
         }
     }
@@ -744,7 +765,8 @@ impl<'a> Iterator for InsnOpndIterator<'a> {
             Insn::JoMul(target) |
             Insn::Jz(target) |
             Insn::Label(target) |
-            Insn::LeaJumpTarget { target, .. } => {
+            Insn::LeaJumpTarget { target, .. } |
+            Insn::PatchPoint(target) => {
                 if let Target::SideExit { stack, locals, .. } = target {
                     let stack_idx = self.idx;
                     if stack_idx < stack.len() {
@@ -796,6 +818,7 @@ impl<'a> Iterator for InsnOpndIterator<'a> {
             Insn::CPushAll |
             Insn::FrameSetup |
             Insn::FrameTeardown |
+            Insn::PadPatchPoint |
             Insn::PosMarker(_) => None,
 
             Insn::CPopInto(opnd) |
@@ -898,7 +921,8 @@ impl<'a> InsnOpndMutIterator<'a> {
             Insn::JoMul(target) |
             Insn::Jz(target) |
             Insn::Label(target) |
-            Insn::LeaJumpTarget { target, .. } => {
+            Insn::LeaJumpTarget { target, .. } |
+            Insn::PatchPoint(target) => {
                 if let Target::SideExit { stack, locals, .. } = target {
                     let stack_idx = self.idx;
                     if stack_idx < stack.len() {
@@ -950,6 +974,7 @@ impl<'a> InsnOpndMutIterator<'a> {
             Insn::CPushAll |
             Insn::FrameSetup |
             Insn::FrameTeardown |
+            Insn::PadPatchPoint |
             Insn::PosMarker(_) => None,
 
             Insn::CPopInto(opnd) |
@@ -1742,8 +1767,7 @@ impl Assembler
     /// Compile the instructions down to machine code.
     /// Can fail due to lack of code memory and inopportune code placement, among other reasons.
     #[must_use]
-    pub fn compile(self, cb: &mut CodeBlock) -> Option<(CodePtr, Vec<u32>)>
-    {
+    pub fn compile(self, cb: &mut CodeBlock) -> Option<(CodePtr, Vec<CodePtr>)> {
         #[cfg(feature = "disasm")]
         let start_addr = cb.get_write_ptr();
         let alloc_regs = Self::get_alloc_regs();
@@ -1760,8 +1784,7 @@ impl Assembler
 
     /// Compile with a limited number of registers. Used only for unit tests.
     #[cfg(test)]
-    pub fn compile_with_num_regs(self, cb: &mut CodeBlock, num_regs: usize) -> (CodePtr, Vec<u32>)
-    {
+    pub fn compile_with_num_regs(self, cb: &mut CodeBlock, num_regs: usize) -> (CodePtr, Vec<CodePtr>) {
         let mut alloc_regs = Self::get_alloc_regs();
         let alloc_regs = alloc_regs.drain(0..num_regs).collect();
         self.compile_with_regs(cb, alloc_regs).unwrap()
@@ -1780,8 +1803,13 @@ impl Assembler
         for (idx, target) in targets {
             // Compile a side exit. Note that this is past the split pass and alloc_regs(),
             // so you can't use a VReg or an instruction that needs to be split.
-            if let Target::SideExit { pc, stack, locals, c_stack_bytes } = target {
-                let side_exit_label = self.new_label("side_exit".into());
+            if let Target::SideExit { pc, stack, locals, c_stack_bytes, reason, label } = target {
+                asm_comment!(self, "Exit: {reason}");
+                let side_exit_label = if let Some(label) = label {
+                    Target::Label(label)
+                } else {
+                    self.new_label("side_exit".into())
+                };
                 self.write_label(side_exit_label.clone());
 
                 // Load an operand that cannot be used as a source of Insn::Store
@@ -2164,7 +2192,14 @@ impl Assembler {
         out
     }
 
-    //pub fn pos_marker<F: FnMut(CodePtr)>(&mut self, marker_fn: F)
+    pub fn patch_point(&mut self, target: Target) {
+        self.push_insn(Insn::PatchPoint(target));
+    }
+
+    pub fn pad_patch_point(&mut self) {
+        self.push_insn(Insn::PadPatchPoint);
+    }
+
     pub fn pos_marker(&mut self, marker_fn: impl Fn(CodePtr, &CodeBlock) + 'static) {
         self.push_insn(Insn::PosMarker(Box::new(marker_fn)));
     }

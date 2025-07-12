@@ -7,13 +7,7 @@ use crate::{
     cast::IntoUsize, cruby::*, options::{get_option, DumpHIR}, gc::{get_or_create_iseq_payload, IseqPayload}, state::ZJITState
 };
 use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
-    ffi::{c_int, c_void, CStr},
-    mem::{align_of, size_of},
-    num::NonZeroU32,
-    ptr,
-    slice::Iter
+    cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_int, c_void, CStr}, fmt::Display, mem::{align_of, size_of}, ptr, slice::Iter
 };
 use crate::hir_type::{Type, types};
 use crate::bitset::BitSet;
@@ -146,6 +140,12 @@ pub enum Invariant {
 impl Invariant {
     pub fn print(self, ptr_map: &PtrPrintMap) -> InvariantPrinter {
         InvariantPrinter { inner: self, ptr_map }
+    }
+}
+
+impl Display for Invariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.print(&PtrPrintMap::identity()).fmt(f)
     }
 }
 
@@ -403,11 +403,17 @@ impl PtrPrintMap {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum SideExitReason {
     UnknownNewarraySend(vm_opt_newarray_send_type),
     UnknownCallType,
     UnknownOpcode(u32),
+    FixnumAddOverflow,
+    FixnumSubOverflow,
+    FixnumMultOverflow,
+    GuardType(Type),
+    GuardBitEquals(VALUE),
+    PatchPoint(Invariant),
 }
 
 impl std::fmt::Display for SideExitReason {
@@ -420,6 +426,9 @@ impl std::fmt::Display for SideExitReason {
             SideExitReason::UnknownNewarraySend(VM_OPT_NEWARRAY_SEND_PACK) => write!(f, "UnknownNewarraySend(PACK)"),
             SideExitReason::UnknownNewarraySend(VM_OPT_NEWARRAY_SEND_PACK_BUFFER) => write!(f, "UnknownNewarraySend(PACK_BUFFER)"),
             SideExitReason::UnknownNewarraySend(VM_OPT_NEWARRAY_SEND_INCLUDE_P) => write!(f, "UnknownNewarraySend(INCLUDE_P)"),
+            SideExitReason::GuardType(guard_type) => write!(f, "GuardType({guard_type})"),
+            SideExitReason::GuardBitEquals(value) => write!(f, "GuardBitEquals({})", value.print(&PtrPrintMap::identity())),
+            SideExitReason::PatchPoint(invariant) => write!(f, "PatchPoint({invariant})"),
             _ => write!(f, "{self:?}"),
         }
     }
@@ -480,10 +489,10 @@ pub enum Insn {
     /// Check whether an instance variable exists on `self_val`
     DefinedIvar { self_val: InsnId, id: ID, pushval: VALUE, state: InsnId },
 
-    /// Get a local variable from a higher scope
-    GetLocal { level: NonZeroU32, ep_offset: u32 },
-    /// Set a local variable in a higher scope
-    SetLocal { level: NonZeroU32, ep_offset: u32, val: InsnId },
+    /// Get a local variable from a higher scope or the heap
+    GetLocal { level: u32, ep_offset: u32 },
+    /// Set a local variable in a higher scope or the heap
+    SetLocal { level: u32, ep_offset: u32, val: InsnId },
 
     /// Own a FrameState so that instructions can look up their dominating FrameState when
     /// generating deopt side-exits and frame reconstruction metadata. Does not directly generate
@@ -549,7 +558,7 @@ pub enum Insn {
 
     /// Generate no code (or padding if necessary) and insert a patch point
     /// that can be rewritten to a side exit when the Invariant is broken.
-    PatchPoint(Invariant),
+    PatchPoint { invariant: Invariant, state: InsnId },
 
     /// Side-exit into the interpreter.
     SideExit { state: InsnId, reason: SideExitReason },
@@ -559,7 +568,7 @@ impl Insn {
     /// Not every instruction returns a value. Return true if the instruction does and false otherwise.
     pub fn has_output(&self) -> bool {
         match self {
-            Insn::ArraySet { .. } | Insn::Snapshot { .. } | Insn::Jump(_)
+            Insn::ArraySet { .. } | Insn::Jump(_)
             | Insn::IfTrue { .. } | Insn::IfFalse { .. } | Insn::Return { .. }
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetGlobal { .. }
@@ -713,7 +722,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FixnumOr   { left, right, .. } => { write!(f, "FixnumOr {left}, {right}") },
             Insn::GuardType { val, guard_type, .. } => { write!(f, "GuardType {val}, {}", guard_type.print(self.ptr_map)) },
             Insn::GuardBitEquals { val, expected, .. } => { write!(f, "GuardBitEquals {val}, {}", expected.print(self.ptr_map)) },
-            Insn::PatchPoint(invariant) => { write!(f, "PatchPoint {}", invariant.print(self.ptr_map)) },
+            Insn::PatchPoint { invariant, .. } => { write!(f, "PatchPoint {}", invariant.print(self.ptr_map)) },
             Insn::GetConstantPath { ic, .. } => { write!(f, "GetConstantPath {:p}", self.ptr_map.map_ptr(ic)) },
             Insn::CCall { cfun, args, name, return_type: _, elidable: _ } => {
                 write!(f, "CCall {}@{:p}", name.contents_lossy(), self.ptr_map.map_ptr(cfun))?;
@@ -918,12 +927,16 @@ impl<T: Copy + Into<usize> + PartialEq> UnionFind<T> {
 
 #[derive(Debug, PartialEq)]
 pub enum ValidationError {
-    // All validation errors come with the function's representation as the first argument.
-    BlockHasNoTerminator(String, BlockId),
+    BlockHasNoTerminator(BlockId),
     // The terminator and its actual position
-    TerminatorNotAtEnd(String, BlockId, InsnId, usize),
+    TerminatorNotAtEnd(BlockId, InsnId, usize),
     /// Expected length, actual length
-    MismatchedBlockArity(String, BlockId, usize, usize),
+    MismatchedBlockArity(BlockId, usize, usize),
+    JumpTargetNotInRPO(BlockId),
+    // The offending instruction, and the operand
+    OperandNotDefined(BlockId, InsnId, InsnId),
+    /// The offending block and instruction
+    DuplicateInstruction(BlockId, InsnId),
 }
 
 
@@ -1160,7 +1173,7 @@ impl Function {
             ArrayMax { elements, state } => ArrayMax { elements: find_vec!(*elements), state: find!(*state) },
             &SetGlobal { id, val, state } => SetGlobal { id, val: find!(val), state },
             &GetIvar { self_val, id, state } => GetIvar { self_val: find!(self_val), id, state },
-            &SetIvar { self_val, id, val, state } => SetIvar { self_val: find!(self_val), id, val, state },
+            &SetIvar { self_val, id, val, state } => SetIvar { self_val: find!(self_val), id, val: find!(val), state },
             &SetLocal { val, ep_offset, level } => SetLocal { val: find!(val), ep_offset, level },
             &ToArray { val, state } => ToArray { val: find!(val), state },
             &ToNewArray { val, state } => ToNewArray { val: find!(val), state },
@@ -1189,7 +1202,7 @@ impl Function {
         assert!(self.insns[insn.0].has_output());
         match &self.insns[insn.0] {
             Insn::Param { .. } => unimplemented!("params should not be present in block.insns"),
-            Insn::SetGlobal { .. } | Insn::ArraySet { .. } | Insn::Snapshot { .. } | Insn::Jump(_)
+            Insn::SetGlobal { .. } | Insn::ArraySet { .. } | Insn::Jump(_)
             | Insn::IfTrue { .. } | Insn::IfFalse { .. } | Insn::Return { .. } | Insn::Throw { .. }
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetLocal { .. } =>
@@ -1251,6 +1264,9 @@ impl Function {
             Insn::ObjToString { .. } => types::BasicObject,
             Insn::AnyToString { .. } => types::String,
             Insn::GetLocal { .. } => types::BasicObject,
+            // The type of Snapshot doesn't really matter; it's never materialized. It's used only
+            // as a reference for FrameState, which we use to generate side-exit code.
+            Insn::Snapshot { .. } => types::Any,
         }
     }
 
@@ -1360,9 +1376,9 @@ impl Function {
         if self.arguments_likely_fixnums(left, right, state) {
             if bop == BOP_NEQ {
                 // For opt_neq, the interpreter checks that both neq and eq are unchanged.
-                self.push_insn(block, Insn::PatchPoint(Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop: BOP_EQ }));
+                self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop: BOP_EQ }, state });
             }
-            self.push_insn(block, Insn::PatchPoint(Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop }));
+            self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop }, state });
             let left = self.coerce_to_fixnum(block, left, state);
             let right = self.coerce_to_fixnum(block, right, state);
             let result = self.push_insn(block, f(left, right));
@@ -1373,11 +1389,11 @@ impl Function {
         }
     }
 
-    fn rewrite_if_frozen(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, klass: u32, bop: u32) {
+    fn rewrite_if_frozen(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, klass: u32, bop: u32, state: InsnId) {
         let self_type = self.type_of(self_val);
         if let Some(obj) = self_type.ruby_object() {
             if obj.is_frozen() {
-                self.push_insn(block, Insn::PatchPoint(Invariant::BOPRedefined { klass, bop }));
+                self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass, bop }, state });
                 self.make_equal_to(orig_insn_id, self_val);
                 return;
             }
@@ -1385,34 +1401,34 @@ impl Function {
         self.push_insn_id(block, orig_insn_id);
     }
 
-    fn try_rewrite_freeze(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId) {
+    fn try_rewrite_freeze(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, state: InsnId) {
         if self.is_a(self_val, types::StringExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_FREEZE);
+            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_FREEZE, state);
         } else if self.is_a(self_val, types::ArrayExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE);
+            self.rewrite_if_frozen(block, orig_insn_id, self_val, ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE, state);
         } else if self.is_a(self_val, types::HashExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, HASH_REDEFINED_OP_FLAG, BOP_FREEZE);
+            self.rewrite_if_frozen(block, orig_insn_id, self_val, HASH_REDEFINED_OP_FLAG, BOP_FREEZE, state);
         } else {
             self.push_insn_id(block, orig_insn_id);
         }
     }
 
-    fn try_rewrite_uminus(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId) {
+    fn try_rewrite_uminus(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, state: InsnId) {
         if self.is_a(self_val, types::StringExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_UMINUS);
+            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_UMINUS, state);
         } else {
             self.push_insn_id(block, orig_insn_id);
         }
     }
 
-    fn try_rewrite_aref(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, idx_val: InsnId) {
+    fn try_rewrite_aref(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, idx_val: InsnId, state: InsnId) {
         let self_type = self.type_of(self_val);
         let idx_type = self.type_of(idx_val);
         if self_type.is_subtype(types::ArrayExact) {
             if let Some(array_obj) = self_type.ruby_object() {
                 if array_obj.is_frozen() {
                     if let Some(idx) = idx_type.fixnum_value() {
-                        self.push_insn(block, Insn::PatchPoint(Invariant::BOPRedefined { klass: ARRAY_REDEFINED_OP_FLAG, bop: BOP_AREF }));
+                        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass: ARRAY_REDEFINED_OP_FLAG, bop: BOP_AREF }, state });
                         let val = unsafe { rb_yarv_ary_entry_internal(array_obj, idx) };
                         let const_insn = self.push_insn(block, Insn::Const { val: Const::Value(val) });
                         self.make_equal_to(orig_insn_id, const_insn);
@@ -1458,12 +1474,12 @@ impl Function {
                         self.try_rewrite_fixnum_op(block, insn_id, &|left, right| Insn::FixnumAnd { left, right }, BOP_AND, self_val, args[0], state),
                     Insn::SendWithoutBlock { self_val, call_info: CallInfo { method_name }, args, state, .. } if method_name == "|" && args.len() == 1 =>
                         self.try_rewrite_fixnum_op(block, insn_id, &|left, right| Insn::FixnumOr { left, right }, BOP_OR, self_val, args[0], state),
-                    Insn::SendWithoutBlock { self_val, call_info: CallInfo { method_name }, args, .. } if method_name == "freeze" && args.len() == 0 =>
-                        self.try_rewrite_freeze(block, insn_id, self_val),
-                    Insn::SendWithoutBlock { self_val, call_info: CallInfo { method_name }, args, .. } if method_name == "-@" && args.len() == 0 =>
-                        self.try_rewrite_uminus(block, insn_id, self_val),
-                    Insn::SendWithoutBlock { self_val, call_info: CallInfo { method_name }, args, .. } if method_name == "[]" && args.len() == 1 =>
-                        self.try_rewrite_aref(block, insn_id, self_val, args[0]),
+                    Insn::SendWithoutBlock { self_val, call_info: CallInfo { method_name }, args, state, .. } if method_name == "freeze" && args.len() == 0 =>
+                        self.try_rewrite_freeze(block, insn_id, self_val, state),
+                    Insn::SendWithoutBlock { self_val, call_info: CallInfo { method_name }, args, state, .. } if method_name == "-@" && args.len() == 0 =>
+                        self.try_rewrite_uminus(block, insn_id, self_val, state),
+                    Insn::SendWithoutBlock { self_val, call_info: CallInfo { method_name }, args, state, .. } if method_name == "[]" && args.len() == 1 =>
+                        self.try_rewrite_aref(block, insn_id, self_val, args[0], state),
                     Insn::SendWithoutBlock { mut self_val, call_info, cd, args, state } => {
                         let frame_state = self.frame_state(state);
                         let (klass, guard_equal_to) = if let Some(klass) = self.type_of(self_val).runtime_exact_ruby_class() {
@@ -1491,7 +1507,7 @@ impl Function {
                             // TODO(max): Allow non-iseq; cache cme
                             self.push_insn_id(block, insn_id); continue;
                         }
-                        self.push_insn(block, Insn::PatchPoint(Invariant::MethodRedefined { klass, method: mid }));
+                        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid }, state });
                         let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
                         if let Some(expected) = guard_equal_to {
                             self_val = self.push_insn(block, Insn::GuardBitEquals { val: self_val, expected, state });
@@ -1499,7 +1515,7 @@ impl Function {
                         let send_direct = self.push_insn(block, Insn::SendWithoutBlockDirect { self_val, call_info, cd, cme, iseq, args, state });
                         self.make_equal_to(insn_id, send_direct);
                     }
-                    Insn::GetConstantPath { ic, .. } => {
+                    Insn::GetConstantPath { ic, state, .. } => {
                         let idlist: *const ID = unsafe { (*ic).segments };
                         let ice = unsafe { (*ic).entry };
                         if ice.is_null() {
@@ -1511,10 +1527,10 @@ impl Function {
                             self.push_insn_id(block, insn_id); continue;
                         }
                         // Assume single-ractor mode.
-                        self.push_insn(block, Insn::PatchPoint(Invariant::SingleRactorMode));
+                        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::SingleRactorMode, state });
                         // Invalidate output code on any constant writes associated with constants
                         // referenced after the PatchPoint.
-                        self.push_insn(block, Insn::PatchPoint(Invariant::StableConstantNames { idlist }));
+                        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist }, state });
                         let replacement = self.push_insn(block, Insn::Const { val: Const::Value(unsafe { (*ice).value }) });
                         self.make_equal_to(insn_id, replacement);
                     }
@@ -1610,7 +1626,7 @@ impl Function {
                     // Filter for simple call sites (i.e. no splats etc.)
                     if ci_flags & VM_CALL_ARGS_SIMPLE != 0 {
                         // Commit to the replacement. Put PatchPoint.
-                        fun.push_insn(block, Insn::PatchPoint(Invariant::MethodRedefined { klass: recv_class, method: method_id }));
+                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: recv_class, method: method_id }, state });
                         if let Some(guard_type) = guard_type {
                             // Guard receiver class
                             self_val = fun.push_insn(block, Insn::GuardType { val: self_val, guard_type, state });
@@ -1781,6 +1797,131 @@ impl Function {
         }
     }
 
+    fn worklist_traverse_single_insn(&self, insn: &Insn, worklist: &mut VecDeque<InsnId>) {
+        match insn {
+            &Insn::Const { .. }
+            | &Insn::Param { .. }
+            | &Insn::GetLocal { .. }
+            | &Insn::PutSpecialObject { .. } =>
+                {}
+            &Insn::PatchPoint { state, .. }
+            | &Insn::GetConstantPath { ic: _, state } => {
+                worklist.push_back(state);
+            }
+            &Insn::ArrayMax { ref elements, state }
+            | &Insn::NewArray { ref elements, state } => {
+                worklist.extend(elements);
+                worklist.push_back(state);
+            }
+            &Insn::NewHash { ref elements, state } => {
+                for &(key, value) in elements {
+                    worklist.push_back(key);
+                    worklist.push_back(value);
+                }
+                worklist.push_back(state);
+            }
+            &Insn::NewRange { low, high, state, .. } => {
+                worklist.push_back(low);
+                worklist.push_back(high);
+                worklist.push_back(state);
+            }
+            &Insn::StringCopy { val, .. }
+            | &Insn::StringIntern { val }
+            | &Insn::Return { val }
+            | &Insn::Throw { val, .. }
+            | &Insn::Defined { v: val, .. }
+            | &Insn::Test { val }
+            | &Insn::SetLocal { val, .. }
+            | &Insn::IsNil { val } =>
+                worklist.push_back(val),
+            &Insn::SetGlobal { val, state, .. }
+            | &Insn::GuardType { val, state, .. }
+            | &Insn::GuardBitEquals { val, state, .. }
+            | &Insn::ToArray { val, state }
+            | &Insn::ToNewArray { val, state } => {
+                worklist.push_back(val);
+                worklist.push_back(state);
+            }
+            &Insn::ArraySet { array, val, .. } => {
+                worklist.push_back(array);
+                worklist.push_back(val);
+            }
+            &Insn::Snapshot { ref state } => {
+                worklist.extend(&state.stack);
+                worklist.extend(&state.locals);
+            }
+            &Insn::FixnumAdd { left, right, state }
+            | &Insn::FixnumSub { left, right, state }
+            | &Insn::FixnumMult { left, right, state }
+            | &Insn::FixnumDiv { left, right, state }
+            | &Insn::FixnumMod { left, right, state }
+            | &Insn::ArrayExtend { left, right, state }
+            => {
+                worklist.push_back(left);
+                worklist.push_back(right);
+                worklist.push_back(state);
+            }
+            &Insn::FixnumLt { left, right }
+            | &Insn::FixnumLe { left, right }
+            | &Insn::FixnumGt { left, right }
+            | &Insn::FixnumGe { left, right }
+            | &Insn::FixnumEq { left, right }
+            | &Insn::FixnumNeq { left, right }
+            | &Insn::FixnumAnd { left, right }
+            | &Insn::FixnumOr { left, right }
+            => {
+                worklist.push_back(left);
+                worklist.push_back(right);
+            }
+            &Insn::Jump(BranchEdge { ref args, .. }) => worklist.extend(args),
+            &Insn::IfTrue { val, target: BranchEdge { ref args, .. } } | &Insn::IfFalse { val, target: BranchEdge { ref args, .. } } => {
+                worklist.push_back(val);
+                worklist.extend(args);
+            }
+            &Insn::ArrayDup { val, state } | &Insn::HashDup { val, state } => {
+                worklist.push_back(val);
+                worklist.push_back(state);
+            }
+            &Insn::Send { self_val, ref args, state, .. }
+            | &Insn::SendWithoutBlock { self_val, ref args, state, .. }
+            | &Insn::SendWithoutBlockDirect { self_val, ref args, state, .. } => {
+                worklist.push_back(self_val);
+                worklist.extend(args);
+                worklist.push_back(state);
+            }
+            &Insn::InvokeBuiltin { ref args, state, .. } => {
+                worklist.extend(args);
+                worklist.push_back(state)
+            }
+            &Insn::CCall { ref args, .. } => worklist.extend(args),
+            &Insn::GetIvar { self_val, state, .. } | &Insn::DefinedIvar { self_val, state, .. } => {
+                worklist.push_back(self_val);
+                worklist.push_back(state);
+            }
+            &Insn::SetIvar { self_val, val, state, .. } => {
+                worklist.push_back(self_val);
+                worklist.push_back(val);
+                worklist.push_back(state);
+            }
+            &Insn::ArrayPush { array, val, state } => {
+                worklist.push_back(array);
+                worklist.push_back(val);
+                worklist.push_back(state);
+            }
+            &Insn::ObjToString { val, state, .. } => {
+                worklist.push_back(val);
+                worklist.push_back(state);
+            }
+            &Insn::AnyToString { val, str, state, .. } => {
+                worklist.push_back(val);
+                worklist.push_back(str);
+                worklist.push_back(state);
+            }
+            &Insn::GetGlobal { state, .. } |
+            &Insn::SideExit { state, .. } => worklist.push_back(state),
+        }
+    }
+
     /// Remove instructions that do not have side effects and are not referenced by any other
     /// instruction.
     fn eliminate_dead_code(&mut self) {
@@ -1801,128 +1942,7 @@ impl Function {
         while let Some(insn_id) = worklist.pop_front() {
             if necessary.get(insn_id) { continue; }
             necessary.insert(insn_id);
-            match self.find(insn_id) {
-                Insn::Const { .. }
-                | Insn::Param { .. }
-                | Insn::PatchPoint(..)
-                | Insn::GetLocal { .. }
-                | Insn::PutSpecialObject { .. } =>
-                    {}
-                Insn::GetConstantPath { ic: _, state } => {
-                    worklist.push_back(state);
-                }
-                Insn::ArrayMax { elements, state }
-                | Insn::NewArray { elements, state } => {
-                    worklist.extend(elements);
-                    worklist.push_back(state);
-                }
-                Insn::NewHash { elements, state } => {
-                    for (key, value) in elements {
-                        worklist.push_back(key);
-                        worklist.push_back(value);
-                    }
-                    worklist.push_back(state);
-                }
-                Insn::NewRange { low, high, state, .. } => {
-                    worklist.push_back(low);
-                    worklist.push_back(high);
-                    worklist.push_back(state);
-                }
-                Insn::StringCopy { val, .. }
-                | Insn::StringIntern { val }
-                | Insn::Return { val }
-                | Insn::Throw { val, .. }
-                | Insn::Defined { v: val, .. }
-                | Insn::Test { val }
-                | Insn::SetLocal { val, .. }
-                | Insn::IsNil { val } =>
-                    worklist.push_back(val),
-                Insn::SetGlobal { val, state, .. }
-                | Insn::GuardType { val, state, .. }
-                | Insn::GuardBitEquals { val, state, .. }
-                | Insn::ToArray { val, state }
-                | Insn::ToNewArray { val, state } => {
-                    worklist.push_back(val);
-                    worklist.push_back(state);
-                }
-                Insn::ArraySet { array, val, .. } => {
-                    worklist.push_back(array);
-                    worklist.push_back(val);
-                }
-                Insn::Snapshot { state } => {
-                    worklist.extend(&state.stack);
-                    worklist.extend(&state.locals);
-                }
-                Insn::FixnumAdd { left, right, state }
-                | Insn::FixnumSub { left, right, state }
-                | Insn::FixnumMult { left, right, state }
-                | Insn::FixnumDiv { left, right, state }
-                | Insn::FixnumMod { left, right, state }
-                | Insn::ArrayExtend { left, right, state }
-                => {
-                    worklist.push_back(left);
-                    worklist.push_back(right);
-                    worklist.push_back(state);
-                }
-                Insn::FixnumLt { left, right }
-                | Insn::FixnumLe { left, right }
-                | Insn::FixnumGt { left, right }
-                | Insn::FixnumGe { left, right }
-                | Insn::FixnumEq { left, right }
-                | Insn::FixnumNeq { left, right }
-                | Insn::FixnumAnd { left, right }
-                | Insn::FixnumOr { left, right }
-                => {
-                    worklist.push_back(left);
-                    worklist.push_back(right);
-                }
-                Insn::Jump(BranchEdge { args, .. }) => worklist.extend(args),
-                Insn::IfTrue { val, target: BranchEdge { args, .. } } | Insn::IfFalse { val, target: BranchEdge { args, .. } } => {
-                    worklist.push_back(val);
-                    worklist.extend(args);
-                }
-                Insn::ArrayDup { val, state } | Insn::HashDup { val, state } => {
-                    worklist.push_back(val);
-                    worklist.push_back(state);
-                }
-                Insn::Send { self_val, args, state, .. }
-                | Insn::SendWithoutBlock { self_val, args, state, .. }
-                | Insn::SendWithoutBlockDirect { self_val, args, state, .. } => {
-                    worklist.push_back(self_val);
-                    worklist.extend(args);
-                    worklist.push_back(state);
-                }
-                Insn::InvokeBuiltin { args, state, .. } => {
-                    worklist.extend(args);
-                    worklist.push_back(state)
-                }
-                Insn::CCall { args, .. } => worklist.extend(args),
-                Insn::GetIvar { self_val, state, .. } | Insn::DefinedIvar { self_val, state, .. } => {
-                    worklist.push_back(self_val);
-                    worklist.push_back(state);
-                }
-                Insn::SetIvar { self_val, val, state, .. } => {
-                    worklist.push_back(self_val);
-                    worklist.push_back(val);
-                    worklist.push_back(state);
-                }
-                Insn::ArrayPush { array, val, state } => {
-                    worklist.push_back(array);
-                    worklist.push_back(val);
-                    worklist.push_back(state);
-                }
-                Insn::ObjToString { val, state, .. } => {
-                    worklist.push_back(val);
-                    worklist.push_back(state);
-                }
-                Insn::AnyToString { val, str, state, .. } => {
-                    worklist.push_back(val);
-                    worklist.push_back(str);
-                    worklist.push_back(state);
-                }
-                Insn::GetGlobal { state, .. } |
-                Insn::SideExit { state, .. } => worklist.push_back(state),
-            }
+            self.worklist_traverse_single_insn(&self.find(insn_id), &mut worklist);
         }
         // Now remove all unnecessary instructions
         for block_id in &rpo {
@@ -2024,14 +2044,28 @@ impl Function {
         result
     }
 
+    fn assert_validates(&self) {
+        if let Err(err) = self.validate() {
+            eprintln!("Function failed validation.");
+            eprintln!("Err: {err:?}");
+            eprintln!("{}", FunctionPrinter::with_snapshot(self));
+            panic!("Aborting...");
+        }
+    }
+
     /// Run all the optimization passes we have.
     pub fn optimize(&mut self) {
         // Function is assumed to have types inferred already
         self.optimize_direct_sends();
+        #[cfg(debug_assertions)] self.assert_validates();
         self.optimize_c_calls();
+        #[cfg(debug_assertions)] self.assert_validates();
         self.fold_constants();
+        #[cfg(debug_assertions)] self.assert_validates();
         self.clean_cfg();
+        #[cfg(debug_assertions)] self.assert_validates();
         self.eliminate_dead_code();
+        #[cfg(debug_assertions)] self.assert_validates();
 
         // Dump HIR after optimization
         match get_option!(dump_hir_opt) {
@@ -2061,7 +2095,7 @@ impl Function {
                         let target_len = target_block.params.len();
                         let args_len = args.len();
                         if target_len != args_len {
-                            return Err(ValidationError::MismatchedBlockArity(format!("{:?}", self), block_id, target_len, args_len))
+                            return Err(ValidationError::MismatchedBlockArity(block_id, target_len, args_len))
                         }
                     }
                     _ => {}
@@ -2071,11 +2105,93 @@ impl Function {
                 }
                 block_has_terminator = true;
                 if idx != insns.len() - 1 {
-                    return Err(ValidationError::TerminatorNotAtEnd(format!("{:?}", self), block_id, *insn_id, idx));
+                    return Err(ValidationError::TerminatorNotAtEnd(block_id, *insn_id, idx));
                 }
             }
             if !block_has_terminator {
-                return Err(ValidationError::BlockHasNoTerminator(format!("{:?}", self), block_id));
+                return Err(ValidationError::BlockHasNoTerminator(block_id));
+            }
+        }
+        Ok(())
+    }
+
+    // This performs a dataflow def-analysis over the entire CFG to detect any
+    // possibly undefined instruction operands.
+    fn validate_definite_assignment(&self) -> Result<(), ValidationError> {
+        // Map of block ID -> InsnSet
+        // Initialize with all missing values at first, to catch if a jump target points to a
+        // missing location.
+        let mut assigned_in = vec![None; self.num_blocks()];
+        let rpo = self.rpo();
+        // Begin with every block having every variable defined, except for the entry block, which
+        // starts with nothing defined.
+        assigned_in[self.entry_block.0] = Some(InsnSet::with_capacity(self.insns.len()));
+        for &block in &rpo {
+            if block != self.entry_block {
+                let mut all_ones = InsnSet::with_capacity(self.insns.len());
+                all_ones.insert_all();
+                assigned_in[block.0] = Some(all_ones);
+            }
+        }
+        let mut worklist = VecDeque::with_capacity(self.num_blocks());
+        worklist.push_back(self.entry_block);
+        while let Some(block) = worklist.pop_front() {
+            let mut assigned = assigned_in[block.0].clone().unwrap();
+            for &param in &self.blocks[block.0].params {
+                assigned.insert(param);
+            }
+            for &insn_id in &self.blocks[block.0].insns {
+                let insn_id = self.union_find.borrow().find_const(insn_id);
+                match self.find(insn_id) {
+                    Insn::Jump(target) | Insn::IfTrue { target, .. } | Insn::IfFalse { target, .. } => {
+                        let Some(block_in) = assigned_in[target.target.0].as_mut() else {
+                            return Err(ValidationError::JumpTargetNotInRPO(target.target));
+                        };
+                        // jump target's block_in was modified, we need to queue the block for processing.
+                        if block_in.intersect_with(&assigned) {
+                            worklist.push_back(target.target);
+                        }
+                    }
+                    insn if insn.has_output() => {
+                        assigned.insert(insn_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Check that each instruction's operands are assigned
+        for &block in &rpo {
+            let mut assigned = assigned_in[block.0].clone().unwrap();
+            for &param in &self.blocks[block.0].params {
+                assigned.insert(param);
+            }
+            for &insn_id in &self.blocks[block.0].insns {
+                let insn_id = self.union_find.borrow().find_const(insn_id);
+                let mut operands = VecDeque::new();
+                let insn = self.find(insn_id);
+                self.worklist_traverse_single_insn(&insn, &mut operands);
+                for operand in operands {
+                    if !assigned.get(operand) {
+                        return Err(ValidationError::OperandNotDefined(block, insn_id, operand));
+                    }
+                }
+                if insn.has_output() {
+                    assigned.insert(insn_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that each instruction('s representative) appears only once in the CFG.
+    fn validate_insn_uniqueness(&self) -> Result<(), ValidationError> {
+        let mut seen = InsnSet::with_capacity(self.insns.len());
+        for block_id in self.rpo() {
+            for &insn_id in &self.blocks[block_id.0].insns {
+                let insn_id = self.union_find.borrow().find_const(insn_id);
+                if !seen.insert(insn_id) {
+                    return Err(ValidationError::DuplicateInstruction(block_id, insn_id));
+                }
             }
         }
         Ok(())
@@ -2084,6 +2200,8 @@ impl Function {
     /// Run all validation passes we have.
     pub fn validate(&self) -> Result<(), ValidationError> {
         self.validate_block_terminators_and_jumps()?;
+        self.validate_definite_assignment()?;
+        self.validate_insn_uniqueness()?;
         Ok(())
     }
 }
@@ -2439,6 +2557,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     let mut visited = HashSet::new();
 
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+    let iseq_type = unsafe { get_iseq_body_type(iseq) };
     while let Some((incoming_state, block, mut insn_idx)) = queue.pop_front() {
         if visited.contains(&block) { continue; }
         visited.insert(block);
@@ -2533,7 +2652,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                             break;  // End the block
                         },
                     };
-                    fun.push_insn(block, Insn::PatchPoint(Invariant::BOPRedefined { klass: ARRAY_REDEFINED_OP_FLAG, bop }));
+                    fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass: ARRAY_REDEFINED_OP_FLAG, bop }, state: exit_id });
                     state.stack_push(fun.push_insn(block, insn));
                 }
                 YARVINSN_duparray => {
@@ -2682,12 +2801,17 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     break;  // Don't enqueue the next block as a successor
                 }
                 YARVINSN_getlocal_WC_0 => {
-                    // TODO(alan): This implementation doesn't read from EP, so will miss writes
-                    // from nested ISeqs. This will need to be amended when we add codegen for
-                    // Send.
                     let ep_offset = get_arg(pc, 0).as_u32();
-                    let val = state.getlocal(ep_offset);
-                    state.stack_push(val);
+                    if iseq_type == ISEQ_TYPE_EVAL {
+                        // On eval, the locals are always on the heap, so read the local using EP.
+                        state.stack_push(fun.push_insn(block, Insn::GetLocal { ep_offset, level: 0 }));
+                    } else {
+                        // TODO(alan): This implementation doesn't read from EP, so will miss writes
+                        // from nested ISeqs. This will need to be amended when we add codegen for
+                        // Send.
+                        let val = state.getlocal(ep_offset);
+                        state.stack_push(val);
+                    }
                 }
                 YARVINSN_setlocal_WC_0 => {
                     // TODO(alan): This implementation doesn't write to EP, where nested scopes
@@ -2696,23 +2820,27 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     let ep_offset = get_arg(pc, 0).as_u32();
                     let val = state.stack_pop()?;
                     state.setlocal(ep_offset, val);
+                    if iseq_type == ISEQ_TYPE_EVAL {
+                        // On eval, the locals are always on the heap, so write the local using EP.
+                        fun.push_insn(block, Insn::SetLocal { val, ep_offset, level: 0 });
+                    }
                 }
                 YARVINSN_getlocal_WC_1 => {
                     let ep_offset = get_arg(pc, 0).as_u32();
-                    state.stack_push(fun.push_insn(block, Insn::GetLocal { ep_offset, level: NonZeroU32::new(1).unwrap() }));
+                    state.stack_push(fun.push_insn(block, Insn::GetLocal { ep_offset, level: 1 }));
                 }
                 YARVINSN_setlocal_WC_1 => {
                     let ep_offset = get_arg(pc, 0).as_u32();
-                    fun.push_insn(block, Insn::SetLocal { val: state.stack_pop()?, ep_offset, level: NonZeroU32::new(1).unwrap() });
+                    fun.push_insn(block, Insn::SetLocal { val: state.stack_pop()?, ep_offset, level: 1 });
                 }
                 YARVINSN_getlocal => {
                     let ep_offset = get_arg(pc, 0).as_u32();
-                    let level = NonZeroU32::try_from(get_arg(pc, 1).as_u32()).map_err(|_| ParseError::MalformedIseq(insn_idx))?;
+                    let level = get_arg(pc, 1).as_u32();
                     state.stack_push(fun.push_insn(block, Insn::GetLocal { ep_offset, level }));
                 }
                 YARVINSN_setlocal => {
                     let ep_offset = get_arg(pc, 0).as_u32();
-                    let level = NonZeroU32::try_from(get_arg(pc, 1).as_u32()).map_err(|_| ParseError::MalformedIseq(insn_idx))?;
+                    let level = get_arg(pc, 1).as_u32();
                     fun.push_insn(block, Insn::SetLocal { val: state.stack_pop()?, ep_offset, level });
                 }
                 YARVINSN_pop => { state.stack_pop()?; }
@@ -3173,7 +3301,7 @@ mod validation_tests {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
         function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
-        assert_matches_err(function.validate(), ValidationError::BlockHasNoTerminator(format!("{:?}", function), entry));
+        assert_matches_err(function.validate(), ValidationError::BlockHasNoTerminator(entry));
     }
 
     #[test]
@@ -3183,7 +3311,7 @@ mod validation_tests {
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         let insn_id = function.push_insn(entry, Insn::Return { val });
         function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
-        assert_matches_err(function.validate(), ValidationError::TerminatorNotAtEnd(format!("{:?}", function), entry, insn_id, 1));
+        assert_matches_err(function.validate(), ValidationError::TerminatorNotAtEnd(entry, insn_id, 1));
     }
 
     #[test]
@@ -3193,7 +3321,7 @@ mod validation_tests {
         let side = function.new_block();
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfTrue { val, target: BranchEdge { target: side, args: vec![val, val, val] } });
-        assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(format!("{:?}", function), entry, 0, 3));
+        assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(entry, 0, 3));
     }
 
     #[test]
@@ -3203,7 +3331,7 @@ mod validation_tests {
         let side = function.new_block();
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfFalse { val, target: BranchEdge { target: side, args: vec![val, val, val] } });
-        assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(format!("{:?}", function), entry, 0, 3));
+        assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(entry, 0, 3));
     }
 
     #[test]
@@ -3213,7 +3341,100 @@ mod validation_tests {
         let side = function.new_block();
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::Jump ( BranchEdge { target: side, args: vec![val, val, val] } ));
-        assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(format!("{:?}", function), entry, 0, 3));
+        assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(entry, 0, 3));
+    }
+
+    #[test]
+    fn not_defined_within_bb() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        // Create an instruction without making it belong to anything.
+        let dangling = function.new_insn(Insn::Const{val: Const::CBool(true)});
+        let val = function.push_insn(function.entry_block, Insn::ArrayDup { val: dangling, state: InsnId(0usize) });
+        assert_matches_err(function.validate_definite_assignment(), ValidationError::OperandNotDefined(entry, val, dangling));
+    }
+
+    #[test]
+    fn using_non_output_insn() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let const_ = function.push_insn(function.entry_block, Insn::Const{val: Const::CBool(true)});
+        // Ret is a non-output instruction.
+        let ret = function.push_insn(function.entry_block, Insn::Return { val: const_ });
+        let val = function.push_insn(function.entry_block, Insn::ArrayDup { val: ret, state: InsnId(0usize) });
+        assert_matches_err(function.validate_definite_assignment(), ValidationError::OperandNotDefined(entry, val, ret));
+    }
+
+    #[test]
+    fn not_dominated_by_diamond() {
+        // This tests that one branch is missing a definition which fails.
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let side = function.new_block();
+        let exit = function.new_block();
+        let v0 = function.push_insn(side, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
+        function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
+        let val1 = function.push_insn(entry, Insn::Const { val: Const::CBool(false) });
+        function.push_insn(entry, Insn::IfFalse { val: val1, target: BranchEdge { target: side, args: vec![] } });
+        function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
+        let val2 = function.push_insn(exit, Insn::ArrayDup { val: v0, state: v0 });
+        crate::cruby::with_rubyvm(|| {
+            function.infer_types();
+            assert_matches_err(function.validate_definite_assignment(), ValidationError::OperandNotDefined(exit, val2, v0));
+        });
+    }
+
+    #[test]
+    fn dominated_by_diamond() {
+        // This tests that both branches with a definition succeeds.
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let side = function.new_block();
+        let exit = function.new_block();
+        let v0 = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
+        function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
+        let val = function.push_insn(entry, Insn::Const { val: Const::CBool(false) });
+        function.push_insn(entry, Insn::IfFalse { val, target: BranchEdge { target: side, args: vec![] } });
+        function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
+        let _val = function.push_insn(exit, Insn::ArrayDup { val: v0, state: v0 });
+        crate::cruby::with_rubyvm(|| {
+            function.infer_types();
+            // Just checking that we don't panic.
+            assert!(function.validate_definite_assignment().is_ok());
+        });
+    }
+
+    #[test]
+    fn instruction_appears_twice_in_same_block() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
+        function.push_insn_id(entry, val);
+        function.push_insn(entry, Insn::Return { val });
+        assert_matches_err(function.validate(), ValidationError::DuplicateInstruction(entry, val));
+    }
+
+    #[test]
+    fn instruction_appears_twice_with_different_ids() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let val0 = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
+        let val1 = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
+        function.make_equal_to(val1, val0);
+        function.push_insn(entry, Insn::Return { val: val0 });
+        assert_matches_err(function.validate(), ValidationError::DuplicateInstruction(entry, val0));
+    }
+
+    #[test]
+    fn instruction_appears_twice_in_different_blocks() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
+        let exit = function.new_block();
+        function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
+        function.push_insn_id(exit, val);
+        function.push_insn(exit, Insn::Return { val });
+        assert_matches_err(function.validate(), ValidationError::DuplicateInstruction(exit, val));
     }
 }
 
@@ -4903,7 +5124,11 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[1] = Const Value(1)
+              v3:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_PLUS)
+              v14:Fixnum[3] = Const Value(3)
+              v6:Fixnum[3] = Const Value(3)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_PLUS)
               v15:Fixnum[6] = Const Value(6)
               Return v15
@@ -4920,7 +5145,11 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[5] = Const Value(5)
+              v3:Fixnum[3] = Const Value(3)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_MINUS)
+              v14:Fixnum[2] = Const Value(2)
+              v6:Fixnum[1] = Const Value(1)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_MINUS)
               v15:Fixnum[1] = Const Value(1)
               Return v15
@@ -4937,6 +5166,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[6] = Const Value(6)
+              v3:Fixnum[7] = Const Value(7)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_MULT)
               v9:Fixnum[42] = Const Value(42)
               Return v9
@@ -4961,6 +5192,7 @@ mod opt_tests {
               v6:Fixnum[0] = Const Value(0)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_MULT)
               v16:Fixnum = GuardType v1, Fixnum
+              v21:Fixnum[0] = Const Value(0)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_PLUS)
               v22:Fixnum[0] = Const Value(0)
               Return v22
@@ -4981,6 +5213,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[1] = Const Value(1)
+              v3:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_LT)
               v8:Fixnum[3] = Const Value(3)
               Return v8
@@ -5001,7 +5235,11 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[1] = Const Value(1)
+              v3:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_LE)
+              v8:Fixnum[2] = Const Value(2)
+              v9:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_LE)
               v14:Fixnum[3] = Const Value(3)
               Return v14
@@ -5022,6 +5260,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[2] = Const Value(2)
+              v3:Fixnum[1] = Const Value(1)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_GT)
               v8:Fixnum[3] = Const Value(3)
               Return v8
@@ -5042,7 +5282,11 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[2] = Const Value(2)
+              v3:Fixnum[1] = Const Value(1)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_GE)
+              v8:Fixnum[2] = Const Value(2)
+              v9:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_GE)
               v14:Fixnum[3] = Const Value(3)
               Return v14
@@ -5063,6 +5307,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[1] = Const Value(1)
+              v3:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_EQ)
               v12:Fixnum[4] = Const Value(4)
               Return v12
@@ -5083,6 +5329,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[2] = Const Value(2)
+              v3:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_EQ)
               v8:Fixnum[3] = Const Value(3)
               Return v8
@@ -5103,6 +5351,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[1] = Const Value(1)
+              v3:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_EQ)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_NEQ)
               v8:Fixnum[3] = Const Value(3)
@@ -5124,6 +5374,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[2] = Const Value(2)
+              v3:Fixnum[2] = Const Value(2)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_EQ)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_NEQ)
               v12:Fixnum[4] = Const Value(4)
@@ -5858,6 +6110,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v1:NilClassExact = Const Value(nil)
+              v4:ArrayExact = NewArray
               PatchPoint MethodRedefined(Array@0x1000, itself@0x1008)
               v7:Fixnum[1] = Const Value(1)
               Return v7
@@ -5877,9 +6131,11 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v1:NilClassExact = Const Value(nil)
               PatchPoint SingleRactorMode
               PatchPoint StableConstantNames(0x1000, M)
-              PatchPoint MethodRedefined(Module@0x1008, name@0x1010)
+              v11:ModuleExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+              PatchPoint MethodRedefined(Module@0x1010, name@0x1018)
               v7:Fixnum[1] = Const Value(1)
               Return v7
         "#]]);
@@ -5896,6 +6152,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v1:NilClassExact = Const Value(nil)
+              v4:ArrayExact = NewArray
               PatchPoint MethodRedefined(Array@0x1000, length@0x1008)
               v7:Fixnum[5] = Const Value(5)
               Return v7
@@ -5994,6 +6252,8 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v1:NilClassExact = Const Value(nil)
+              v4:ArrayExact = NewArray
               PatchPoint MethodRedefined(Array@0x1000, size@0x1008)
               v7:Fixnum[5] = Const Value(5)
               Return v7
@@ -6536,7 +6796,9 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v3:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE)
+              v5:Fixnum[1] = Const Value(1)
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_AREF)
               v11:Fixnum[5] = Const Value(5)
               Return v11
@@ -6551,7 +6813,9 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v3:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE)
+              v5:Fixnum[-3] = Const Value(-3)
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_AREF)
               v11:Fixnum[4] = Const Value(4)
               Return v11
@@ -6566,7 +6830,9 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v3:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE)
+              v5:Fixnum[-10] = Const Value(-10)
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_AREF)
               v11:NilClassExact = Const Value(nil)
               Return v11
@@ -6581,7 +6847,9 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v3:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE)
+              v5:Fixnum[10] = Const Value(10)
               PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_AREF)
               v11:NilClassExact = Const Value(nil)
               Return v11
@@ -6647,6 +6915,7 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:NilClassExact = Const Value(nil)
               PatchPoint MethodRedefined(NilClass@0x1000, nil?@0x1008)
               v5:Fixnum[1] = Const Value(1)
               Return v5
@@ -6679,6 +6948,7 @@ mod opt_tests {
         assert_optimized_method_hir("test", expect![[r#"
             fn test:
             bb0(v0:BasicObject):
+              v2:Fixnum[1] = Const Value(1)
               PatchPoint MethodRedefined(Integer@0x1000, nil?@0x1008)
               v5:Fixnum[2] = Const Value(2)
               Return v5

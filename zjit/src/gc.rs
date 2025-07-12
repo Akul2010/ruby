@@ -1,10 +1,10 @@
 // This module is responsible for marking/moving objects on GC.
 
 use std::ffi::c_void;
-use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
+use crate::{cruby::*, profile::IseqProfile, state::ZJITState, virtualmem::CodePtr};
 
 /// This is all the data ZJIT stores on an ISEQ. We mark objects in this struct on GC.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct IseqPayload {
     /// Type information of YARV instruction operands
     pub profile: IseqProfile,
@@ -12,7 +12,18 @@ pub struct IseqPayload {
     /// JIT code address of the first block
     pub start_ptr: Option<CodePtr>,
 
-    // TODO: Add references to GC offsets in JIT code
+    /// GC offsets of the JIT code. These are the addresses of objects that need to be marked.
+    pub gc_offsets: Vec<CodePtr>,
+}
+
+impl IseqPayload {
+    fn new(iseq_size: u32) -> Self {
+        Self {
+            profile: IseqProfile::new(iseq_size),
+            start_ptr: None,
+            gc_offsets: vec![],
+        }
+    }
 }
 
 /// Get the payload object associated with an iseq. Create one if none exists.
@@ -26,7 +37,8 @@ pub fn get_or_create_iseq_payload(iseq: IseqPtr) -> &'static mut IseqPayload {
             // We drop the payload with Box::from_raw when the GC frees the iseq and calls us.
             // NOTE(alan): Sometimes we read from an iseq without ever writing to it.
             // We allocate in those cases anyways.
-            let new_payload = IseqPayload::default();
+            let iseq_size = get_iseq_encoded_size(iseq);
+            let new_payload = IseqPayload::new(iseq_size);
             let new_payload = Box::into_raw(Box::new(new_payload));
             rb_iseq_set_zjit_payload(iseq, new_payload as VoidPtr);
 
@@ -59,17 +71,65 @@ pub extern "C" fn rb_zjit_iseq_mark(payload: *mut c_void) {
         }
     };
 
+    // Mark objects retained by profiling instructions
     payload.profile.each_object(|object| {
-        // TODO: Implement `rb_zjit_iseq_update_references` and use `rb_gc_mark_movable`
-        unsafe { rb_gc_mark(object); }
+        unsafe { rb_gc_mark_movable(object); }
     });
 
-    // TODO: Mark objects in JIT code
+    // Mark objects baked in JIT code
+    let cb = ZJITState::get_code_block();
+    for &offset in payload.gc_offsets.iter() {
+        let value_ptr: *const u8 = offset.raw_ptr(cb);
+        // Creating an unaligned pointer is well defined unlike in C.
+        let value_ptr = value_ptr as *const VALUE;
+
+        unsafe {
+            let object = value_ptr.read_unaligned();
+            rb_gc_mark_movable(object);
+        }
+    }
 }
 
 /// GC callback for updating GC objects in the per-iseq payload.
+/// This is a mirror of [rb_zjit_iseq_mark].
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_iseq_update_references(_payload: *mut c_void) {
-    // TODO: let `rb_zjit_iseq_mark` use `rb_gc_mark_movable`
-    // and update references using `rb_gc_location` here.
+pub extern "C" fn rb_zjit_iseq_update_references(payload: *mut c_void) {
+    let payload = if payload.is_null() {
+        return; // nothing to mark
+    } else {
+        // SAFETY: The GC takes the VM lock while marking, which
+        // we assert, so we should be synchronized and data race free.
+        //
+        // For aliasing, having the VM lock hopefully also implies that no one
+        // else has an overlapping &mut IseqPayload.
+        unsafe {
+            rb_assert_holding_vm_lock();
+            &mut *(payload as *mut IseqPayload)
+        }
+    };
+
+    // Move objects retained by profiling instructions
+    payload.profile.each_object_mut(|object| {
+        *object = unsafe { rb_gc_location(*object) };
+    });
+
+    // Move objects baked in JIT code
+    let cb = ZJITState::get_code_block();
+    for &offset in payload.gc_offsets.iter() {
+        let value_ptr: *const u8 = offset.raw_ptr(cb);
+        // Creating an unaligned pointer is well defined unlike in C.
+        let value_ptr = value_ptr as *const VALUE;
+
+        let object = unsafe { value_ptr.read_unaligned() };
+        let new_addr = unsafe { rb_gc_location(object) };
+
+        // Only write when the VALUE moves, to be copy-on-write friendly.
+        if new_addr != object {
+            for (byte_idx, &byte) in new_addr.as_u64().to_le_bytes().iter().enumerate() {
+                let byte_code_ptr = offset.add_bytes(byte_idx);
+                cb.write_mem(byte_code_ptr, byte).expect("patching existing code should be within bounds");
+            }
+        }
+    }
+    cb.mark_all_executable();
 }

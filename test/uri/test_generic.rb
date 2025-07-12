@@ -846,8 +846,10 @@ class URI::TestGeneric < Test::Unit::TestCase
     assert_equal("http://[::1]/bar", u.to_s)
     u.hostname = "::1"
     assert_equal("http://[::1]/bar", u.to_s)
-    u.hostname = ""
-    assert_equal("http:///bar", u.to_s)
+
+    u = URI("file://foo/bar")
+    u.hostname = ''
+    assert_equal("file:///bar", u.to_s)
   end
 
   def test_build
@@ -868,6 +870,19 @@ class URI::TestGeneric < Test::Unit::TestCase
     assert_equal("http://[::1]/bar/baz", u.to_s)
     assert_equal("[::1]", u.host)
     assert_equal("::1", u.hostname)
+
+    assert_raise_with_message(ArgumentError, /URI::Generic/) {
+      URI::Generic.build(nil)
+    }
+
+    c = Class.new(URI::Generic) do
+      def self.component; raise; end
+    end
+    expected = /\(#{URI::Generic::COMPONENT.join(', ')}\)/
+    message = "fallback to URI::Generic::COMPONENT if component raised"
+    assert_raise_with_message(ArgumentError, expected, message) {
+      c.build(nil)
+    }
   end
 
   def test_build2

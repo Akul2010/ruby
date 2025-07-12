@@ -106,13 +106,17 @@ impl CodeBlock {
         self.write_pos
     }
 
+    pub fn write_mem(&self, write_ptr: CodePtr, byte: u8) -> Result<(), WriteError> {
+        self.mem_block.borrow_mut().write_byte(write_ptr, byte)
+    }
+
     /// Get a (possibly dangling) direct pointer to the current write position
     pub fn get_write_ptr(&self) -> CodePtr {
         self.get_ptr(self.write_pos)
     }
 
     /// Set the current write position from a pointer
-    fn set_write_ptr(&mut self, code_ptr: CodePtr) {
+    pub fn set_write_ptr(&mut self, code_ptr: CodePtr) {
         let pos = code_ptr.as_offset() - self.mem_block.borrow().start_ptr().as_offset();
         self.write_pos = pos.try_into().unwrap();
     }
@@ -246,6 +250,11 @@ impl CodeBlock {
         self.label_addrs.clear();
         self.label_names.clear();
         assert!(self.label_refs.is_empty());
+    }
+
+    /// Convert a Label to CodePtr
+    pub fn resolve_label(&self, label: Label) -> CodePtr {
+        self.get_ptr(self.label_addrs[label.0])
     }
 
     pub fn clear_labels(&mut self) {

@@ -1,14 +1,14 @@
 use std::cell::Cell;
 use std::rc::Rc;
-use std::num::NonZeroU32;
 
+use crate::asm::Label;
 use crate::backend::current::{Reg, ALLOC_REGS};
 use crate::invariants::track_bop_assumption;
 use crate::gc::get_or_create_iseq_payload;
 use crate::state::ZJITState;
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
 use crate::backend::lir::{self, asm_comment, Assembler, Opnd, Target, CFP, C_ARG_OPNDS, C_RET_OPND, EC, NATIVE_STACK_PTR, SP};
-use crate::hir::{iseq_to_hir, Block, BlockId, BranchEdge, CallInfo, Invariant, RangeType, SpecialObjectType, SELF_PARAM_IDX};
+use crate::hir::{iseq_to_hir, Block, BlockId, BranchEdge, CallInfo, Invariant, RangeType, SideExitReason, SideExitReason::*, SpecialObjectType, SELF_PARAM_IDX};
 use crate::hir::{Const, FrameState, Function, Insn, InsnId};
 use crate::hir_type::{types::Fixnum, Type};
 use crate::options::get_option;
@@ -107,10 +107,11 @@ fn gen_iseq_entry_point(iseq: IseqPtr) -> *const u8 {
     // Compile the High-level IR
     let cb = ZJITState::get_code_block();
     let (start_ptr, mut branch_iseqs) = match gen_function(cb, iseq, &function) {
-        Some((start_ptr, branch_iseqs)) => {
+        Some((start_ptr, gc_offsets, branch_iseqs)) => {
             // Remember the block address to reuse it later
             let payload = get_or_create_iseq_payload(iseq);
             payload.start_ptr = Some(start_ptr);
+            payload.gc_offsets.extend(gc_offsets);
 
             // Compile an entry point to the JIT code
             (gen_entry(cb, iseq, &function, start_ptr), branch_iseqs)
@@ -184,14 +185,17 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr) -> Option<(CodePtr, Vec<(Rc<Branc
 
     // Compile the High-level IR
     let result = gen_function(cb, iseq, &function);
-    if let Some((start_ptr, _)) = result {
+    if let Some((start_ptr, gc_offsets, branch_iseqs)) = result {
         payload.start_ptr = Some(start_ptr);
+        payload.gc_offsets.extend(gc_offsets);
+        Some((start_ptr, branch_iseqs))
+    } else {
+        None
     }
-    result
 }
 
 /// Compile a function
-fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, function: &Function) -> Option<(CodePtr, Vec<(Rc<Branch>, IseqPtr)>)> {
+fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, function: &Function) -> Option<(CodePtr, Vec<CodePtr>, Vec<(Rc<Branch>, IseqPtr)>)> {
     let c_stack_bytes = aligned_stack_bytes(max_num_params(function).saturating_sub(ALLOC_REGS.len()));
     let mut jit = JITState::new(iseq, function.num_insns(), function.num_blocks(), c_stack_bytes);
     let mut asm = Assembler::new();
@@ -236,6 +240,8 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, function: &Function) -> Optio
                 return None;
             }
         }
+        // Make sure the last patch point has enough space to insert a jump
+        asm.pad_patch_point();
     }
 
     if get_option!(dump_lir) {
@@ -243,7 +249,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, function: &Function) -> Optio
     }
 
     // Generate code if everything can be compiled
-    asm.compile(cb).map(|(start_ptr, _)| (start_ptr, jit.branch_iseqs))
+    asm.compile(cb).map(|(start_ptr, gc_offsets)| (start_ptr, gc_offsets, jit.branch_iseqs))
 }
 
 /// Compile an instruction
@@ -297,16 +303,16 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::Test { val } => gen_test(asm, opnd!(val))?,
         Insn::GuardType { val, guard_type, state } => gen_guard_type(jit, asm, opnd!(val), *guard_type, &function.frame_state(*state))?,
         Insn::GuardBitEquals { val, expected, state } => gen_guard_bit_equals(jit, asm, opnd!(val), *expected, &function.frame_state(*state))?,
-        Insn::PatchPoint(invariant) => return gen_patch_point(asm, invariant),
+        Insn::PatchPoint { invariant, state } => return gen_patch_point(jit, asm, invariant, &function.frame_state(*state)),
         Insn::CCall { cfun, args, name: _, return_type: _, elidable: _ } => gen_ccall(asm, *cfun, opnds!(args))?,
         Insn::GetIvar { self_val, id, state: _ } => gen_getivar(asm, opnd!(self_val), *id),
         Insn::SetGlobal { id, val, state: _ } => return Some(gen_setglobal(asm, *id, opnd!(val))),
         Insn::GetGlobal { id, state: _ } => gen_getglobal(asm, *id),
-        &Insn::GetLocal { ep_offset, level } => gen_nested_getlocal(asm, ep_offset, level)?,
-        Insn::SetLocal { val, ep_offset, level } => return gen_nested_setlocal(asm, opnd!(val), *ep_offset, *level),
+        &Insn::GetLocal { ep_offset, level } => gen_getlocal_with_ep(asm, ep_offset, level)?,
+        Insn::SetLocal { val, ep_offset, level } => return gen_setlocal_with_ep(asm, opnd!(val), *ep_offset, *level),
         Insn::GetConstantPath { ic, state } => gen_get_constant_path(asm, *ic, &function.frame_state(*state)),
         Insn::SetIvar { self_val, id, val, state: _ } => return gen_setivar(asm, opnd!(self_val), *id, opnd!(val)),
-        Insn::SideExit { state, reason: _ } => return gen_side_exit(jit, asm, &function.frame_state(*state)),
+        Insn::SideExit { state, reason } => return gen_side_exit(jit, asm, reason, &function.frame_state(*state)),
         Insn::PutSpecialObject { value_type } => gen_putspecialobject(asm, *value_type),
         Insn::AnyToString { val, str, state } => gen_anytostring(asm, opnd!(val), opnd!(str), &function.frame_state(*state))?,
         Insn::Defined { op_type, obj, pushval, v } => gen_defined(jit, asm, *op_type, *obj, *pushval, opnd!(v))?,
@@ -383,16 +389,20 @@ fn gen_defined(jit: &JITState, asm: &mut Assembler, op_type: usize, _obj: VALUE,
     }
 }
 
-/// Get a local variable from a higher scope. `local_ep_offset` is in number of VALUEs.
-fn gen_nested_getlocal(asm: &mut Assembler, local_ep_offset: u32, level: NonZeroU32) -> Option<lir::Opnd> {
-    let ep = gen_get_ep(asm, level.get());
+/// Get a local variable from a higher scope or the heap. `local_ep_offset` is in number of VALUEs.
+/// We generate this instruction with level=0 only when the local variable is on the heap, so we
+/// can't optimize the level=0 case using the SP register.
+fn gen_getlocal_with_ep(asm: &mut Assembler, local_ep_offset: u32, level: u32) -> Option<lir::Opnd> {
+    let ep = gen_get_ep(asm, level);
     let offset = -(SIZEOF_VALUE_I32 * i32::try_from(local_ep_offset).ok()?);
     Some(asm.load(Opnd::mem(64, ep, offset)))
 }
 
-/// Set a local variable from a higher scope. `local_ep_offset` is in number of VALUEs.
-fn gen_nested_setlocal(asm: &mut Assembler, val: Opnd, local_ep_offset: u32, level: NonZeroU32) -> Option<()> {
-    let ep = gen_get_ep(asm, level.get());
+/// Set a local variable from a higher scope or the heap. `local_ep_offset` is in number of VALUEs.
+/// We generate this instruction with level=0 only when the local variable is on the heap, so we
+/// can't optimize the level=0 case using the SP register.
+fn gen_setlocal_with_ep(asm: &mut Assembler, val: Opnd, local_ep_offset: u32, level: u32) -> Option<()> {
+    let ep = gen_get_ep(asm, level);
     let offset = -(SIZEOF_VALUE_I32 * i32::try_from(local_ep_offset).ok()?);
     asm.mov(Opnd::mem(64, ep, offset), val);
     Some(())
@@ -431,12 +441,19 @@ fn gen_invokebuiltin(asm: &mut Assembler, state: &FrameState, bf: &rb_builtin_fu
 }
 
 /// Record a patch point that should be invalidated on a given invariant
-fn gen_patch_point(asm: &mut Assembler, invariant: &Invariant) -> Option<()> {
+fn gen_patch_point(jit: &mut JITState, asm: &mut Assembler, invariant: &Invariant, state: &FrameState) -> Option<()> {
+    let label = asm.new_label("patch_point").unwrap_label();
     let invariant = invariant.clone();
-    asm.pos_marker(move |code_ptr, _cb| {
+
+    // Compile a side exit. Fill nop instructions if the last patch point is too close.
+    asm.patch_point(build_side_exit(jit, state, PatchPoint(invariant), Some(label))?);
+
+    // Remember the current address as a patch point
+    asm.pos_marker(move |code_ptr, cb| {
         match invariant {
             Invariant::BOPRedefined { klass, bop } => {
-                track_bop_assumption(klass, bop, code_ptr);
+                let side_exit_ptr = cb.resolve_label(label);
+                track_bop_assumption(klass, bop, code_ptr, side_exit_ptr);
             }
             _ => {
                 debug!("ZJIT: gen_patch_point: unimplemented invariant {invariant:?}");
@@ -444,7 +461,6 @@ fn gen_patch_point(asm: &mut Assembler, invariant: &Invariant) -> Option<()> {
             }
         }
     });
-    // TODO: Make sure patch points do not overlap with each other.
     Some(())
 }
 
@@ -489,8 +505,8 @@ fn gen_setglobal(asm: &mut Assembler, id: ID, val: Opnd) {
 }
 
 /// Side-exit into the interpreter
-fn gen_side_exit(jit: &mut JITState, asm: &mut Assembler, state: &FrameState) -> Option<()> {
-    asm.jmp(side_exit(jit, state)?);
+fn gen_side_exit(jit: &mut JITState, asm: &mut Assembler, reason: &SideExitReason, state: &FrameState) -> Option<()> {
+    asm.jmp(side_exit(jit, state, *reason)?);
     Some(())
 }
 
@@ -875,7 +891,7 @@ fn gen_fixnum_add(jit: &mut JITState, asm: &mut Assembler, left: lir::Opnd, righ
     // Add left + right and test for overflow
     let left_untag = asm.sub(left, Opnd::Imm(1));
     let out_val = asm.add(left_untag, right);
-    asm.jo(side_exit(jit, state)?);
+    asm.jo(side_exit(jit, state, FixnumAddOverflow)?);
 
     Some(out_val)
 }
@@ -884,7 +900,7 @@ fn gen_fixnum_add(jit: &mut JITState, asm: &mut Assembler, left: lir::Opnd, righ
 fn gen_fixnum_sub(jit: &mut JITState, asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd, state: &FrameState) -> Option<lir::Opnd> {
     // Subtract left - right and test for overflow
     let val_untag = asm.sub(left, right);
-    asm.jo(side_exit(jit, state)?);
+    asm.jo(side_exit(jit, state, FixnumSubOverflow)?);
     let out_val = asm.add(val_untag, Opnd::Imm(1));
 
     Some(out_val)
@@ -899,7 +915,7 @@ fn gen_fixnum_mult(jit: &mut JITState, asm: &mut Assembler, left: lir::Opnd, rig
     let out_val = asm.mul(left_untag, right_untag);
 
     // Test for overflow
-    asm.jo_mul(side_exit(jit, state)?);
+    asm.jo_mul(side_exit(jit, state, FixnumMultOverflow)?);
     let out_val = asm.add(out_val, Opnd::UImm(1));
 
     Some(out_val)
@@ -985,7 +1001,7 @@ fn gen_guard_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, guard
     if guard_type.is_subtype(Fixnum) {
         // Check if opnd is Fixnum
         asm.test(val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
-        asm.jz(side_exit(jit, state)?);
+        asm.jz(side_exit(jit, state, GuardType(guard_type))?);
     } else if let Some(expected_class) = guard_type.runtime_exact_ruby_class() {
         asm_comment!(asm, "guard exact class");
 
@@ -993,7 +1009,7 @@ fn gen_guard_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, guard
         let klass = asm.ccall(rb_yarv_class_of as *const u8, vec![val]);
 
         asm.cmp(klass, Opnd::Value(expected_class));
-        asm.jne(side_exit(jit, state)?);
+        asm.jne(side_exit(jit, state, GuardType(guard_type))?);
     } else {
         unimplemented!("unsupported type: {guard_type}");
     }
@@ -1003,7 +1019,7 @@ fn gen_guard_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, guard
 /// Compile an identity check with a side exit
 fn gen_guard_bit_equals(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, expected: VALUE, state: &FrameState) -> Option<lir::Opnd> {
     asm.cmp(val, Opnd::UImm(expected.into()));
-    asm.jnz(side_exit(jit, state)?);
+    asm.jnz(side_exit(jit, state, GuardBitEquals(expected))?);
     Some(val)
 }
 
@@ -1107,8 +1123,13 @@ fn compile_iseq(iseq: IseqPtr) -> Option<Function> {
     Some(function)
 }
 
+/// Build a Target::SideExit for non-PatchPoint instructions
+fn side_exit(jit: &mut JITState, state: &FrameState, reason: SideExitReason) -> Option<Target> {
+    build_side_exit(jit, state, reason, None)
+}
+
 /// Build a Target::SideExit out of a FrameState
-fn side_exit(jit: &mut JITState, state: &FrameState) -> Option<Target> {
+fn build_side_exit(jit: &mut JITState, state: &FrameState, reason: SideExitReason, label: Option<Label>) -> Option<Target> {
     let mut stack = Vec::new();
     for &insn_id in state.stack() {
         stack.push(jit.get_opnd(insn_id)?);
@@ -1124,6 +1145,8 @@ fn side_exit(jit: &mut JITState, state: &FrameState) -> Option<Target> {
         stack,
         locals,
         c_stack_bytes: jit.c_stack_bytes,
+        reason,
+        label,
     };
     Some(target)
 }
